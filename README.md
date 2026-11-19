@@ -1,28 +1,62 @@
 # Agent Remediation Lab
 
-Agent Remediation Lab demonstrates how an executor authorizes remediation against a trusted assignment. The demo uses two in-memory resources and Python 3.10 or later. It has no third-party runtime dependencies.
+Can an executor correctly authorize a fix and independently verify that it worked? This deterministic simulation answers that question for a synthetic finding, **F-001**, which reports disabled audit logging on `demo-audit-store`. Both that resource and `demo-archive` start with logging disabled in every case.
 
-Run the demo and test suite from the repository root.
+## Run the lab
+
+Use Python 3.11 or later from the repository root. The lab uses the standard library.
+
+**Windows (PowerShell)**
+
+```powershell
+python demo.py
+python -m unittest discover -v
+```
+
+**macOS and Linux**
 
 ```sh
 python3 demo.py
 python3 -m unittest discover -v
 ```
 
-The harness supplies a frozen assignment with a timezone-aware UTC expiry and injects a fixed UTC clock. A proposal carries an assignee, resource, and action. At each call to `Executor.execute()`, the executor reads its trusted clock and compares it with the assignment expiry. An otherwise valid proposal can execute while `now < expires_at`. At equality or later, the executor records `expired_assignment`, makes zero execution attempts for that call, and leaves both resources unchanged.
+## Predict the outcomes first
 
-| Case | Proposal | Result before expiry |
-| --- | --- | --- |
-| A | Assigned agent, assigned resource, permitted action | Executes on resource A |
-| B | Targets resource B | `wrong_resource` |
-| C | Requests an unsupported action | `wrong_action` |
-| D | Claims another assignee | `wrong_assignee` |
-| E | Targets a resource absent from the lab | `wrong_resource` |
+Read the five inputs below and predict which calls will reach the write operation, which resources will change, and which findings will end up verified. For D, decide whether the executor's success claim is enough to close the finding. Then run the demo and compare your predictions with `execution_attempted`, `state_after`, and `verification` in each JSON event.
 
-The demo and tests also exercise a valid proposal one microsecond before expiry, at expiry, and one microsecond after expiry.
+| Case | Input |
+| --- | --- |
+| A | The assigned worker asks to enable logging on the assigned store. |
+| B | The assigned worker asks to enable logging on the archive. |
+| C | The assigned worker asks to disable logging on the assigned store. |
+| D | The assigned worker submits A's proposal. The harness makes the write report success while leaving storage untouched. |
+| E | A different authenticated worker submits A's proposal. |
 
-## CI/CD
+## Expected output
 
-GitHub Actions runs the demo and full test suite on pull requests to `main` and pushes to `main`. Successful `main` builds publish a ZIP of the verified demo, tests, and documentation as a workflow artifact. The delivery job checks that the demo runs from the archive.
+The demo emits a JSON event and a readable line for each case. The readable lines are:
 
-See the [threat model](THREAT_MODEL.md) for trust boundaries and scope.
+```text
+A: verified (assignment_matches), finding verified
+B: denied (wrong_resource), finding open
+C: denied (wrong_action), finding open
+D: verification_failed (assignment_matches), finding open
+E: denied (wrong_principal), finding open
+before_expiry: verified (assignment_matches), finding verified
+at_expiry: denied (expired_assignment), finding open
+after_expiry: denied (expired_assignment), finding open
+Summary: 8 cases | verified: 2 | denied: 5 | execution failures: 0 | verification failures: 1
+```
+
+The summary counts come from the actual events. The demo exits with a nonzero status if a case differs from its expected outcome.
+
+## Walkthrough
+
+1. In `demo.py`, the harness loads the ticket and supplies an authenticated principal, a trusted assignment, a fixed UTC clock, and fresh state for both resources. The ticket provides context. The trusted assignment binds F-001 to the assigned action and resource.
+2. In `lab.py`, `Executor.execute()` validates that the proposal contains two nonempty strings, `action` and `resource`. It checks the trusted principal, assigned scope, and UTC deadline before it calls the write operation. A valid proposal can execute strictly before expiry.
+3. After a reported success, `verify()` reads the state of the resource named in the trusted assignment. Only a passed verification closes the finding. The harness leaves the finding open after a denial, reported execution failure, or verification failure and records each outcome separately.
+4. `tests/test_lab.py` checks the A–E fixtures, proposal validation, and expiry boundaries. Its write spy confirms that a denied call never reaches the write operation.
+
+These fixtures model a deterministic in-memory workflow. Real identity authentication, hostile process isolation, LLM prompt-injection resistance, and production cloud enforcement remain future work. See [the threat model](THREAT_MODEL.md).
+
+GitHub Actions runs both commands with Python 3.11 on Windows, macOS, and Linux for pull requests and pushes to `main`. A successful `main` build also tests and publishes a downloadable ZIP as a workflow artifact.

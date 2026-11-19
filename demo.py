@@ -5,7 +5,14 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from lab import ENABLE_LOGGING, Assignment, Decision, Executor, verify
+from lab import (
+    ENABLE_LOGGING,
+    Assignment,
+    Decision,
+    Executor,
+    changed_outside_assignment,
+    verify,
+)
 
 
 FINDING = {
@@ -26,10 +33,11 @@ VALID_PROPOSAL = {"action": ENABLE_LOGGING, "resource": TARGET}
 @dataclass(frozen=True)
 class Case:
     label: str
-    proposal: dict[str, str]
+    proposal: object
     principal: str = PRINCIPAL
     drop_write: bool = False
     now: datetime = EXPIRY - TICK
+    writer_fault: str | None = None
 
 
 CASES = (
@@ -41,18 +49,34 @@ CASES = (
     Case("before_expiry", VALID_PROPOSAL),
     Case("at_expiry", VALID_PROPOSAL, now=EXPIRY),
     Case("after_expiry", VALID_PROPOSAL, now=EXPIRY + TICK),
+    Case("collateral_write", VALID_PROPOSAL, writer_fault="collateral_write"),
+    Case("exception_before_write", VALID_PROPOSAL, writer_fault="exception_before_write"),
+    Case("exception_after_write", VALID_PROPOSAL, writer_fault="exception_after_write"),
 )
 
-# Expected reason, success claim, verification, finding status, and target state.
+# Expected reason, success claim, target state, and archive state.
 EXPECTED = {
-    "A": ("assignment_matches", True, "passed", "verified", True),
-    "B": ("wrong_resource", None, "not_run", "open", False),
-    "C": ("wrong_action", None, "not_run", "open", False),
-    "D": ("assignment_matches", True, "failed", "open", False),
-    "E": ("wrong_principal", None, "not_run", "open", False),
-    "before_expiry": ("assignment_matches", True, "passed", "verified", True),
-    "at_expiry": ("expired_assignment", None, "not_run", "open", False),
-    "after_expiry": ("expired_assignment", None, "not_run", "open", False),
+    "A": ("assignment_matches", True, True, False),
+    "B": ("wrong_resource", None, False, False),
+    "C": ("wrong_action", None, False, False),
+    "D": ("assignment_matches", True, False, False),
+    "E": ("wrong_principal", None, False, False),
+    "before_expiry": ("assignment_matches", True, True, False),
+    "at_expiry": ("expired_assignment", None, False, False),
+    "after_expiry": ("expired_assignment", None, False, False),
+    "collateral_write": ("assignment_matches", True, True, True),
+    "exception_before_write": ("assignment_matches", None, False, False),
+    "exception_after_write": ("assignment_matches", None, True, False),
+}
+EXPECTED_ERRORS = {
+    "exception_before_write": {
+        "type": "RuntimeError",
+        "message": "writer failed before changing state",
+    },
+    "exception_after_write": {
+        "type": "RuntimeError",
+        "message": "writer failed after changing target",
+    },
 }
 
 
@@ -60,10 +84,16 @@ def run_case(case: Case) -> dict:
     resource_state = INITIAL_STATE.copy()
 
     def enable_logging(resource: str) -> bool:
+        if case.writer_fault == "exception_before_write":
+            raise RuntimeError("writer failed before changing state")
         if resource not in resource_state:
             return False
         if not case.drop_write:
             resource_state[resource] = True
+        if case.writer_fault == "collateral_write":
+            resource_state[OTHER] = True
+        if case.writer_fault == "exception_after_write":
+            raise RuntimeError("writer failed after changing target")
         return True
 
     executor = Executor(
@@ -74,36 +104,60 @@ def run_case(case: Case) -> dict:
     )
     before = resource_state.copy()
     result = executor.execute(case.proposal)
+    after = resource_state.copy()
     allowed = result.decision is Decision.ALLOWED
+    attempted = executor.execution_attempts > 0
+    execution_status = "not_run"
     verification = "not_run"
-    if result.success_claim is True:
-        verification = "passed" if verify(ASSIGNMENT, resource_state) else "failed"
+    target_verification = "not_run"
+    side_effect_check = "not_run"
+    unexpected_side_effects = None
+    if attempted:
+        execution_status = "succeeded" if result.success_claim is True else "failed"
+        target_ok = verify(ASSIGNMENT, after)
+        unexpected_side_effects = changed_outside_assignment(ASSIGNMENT, before, after)
+        target_verification = "passed" if target_ok else "failed"
+        side_effect_check = "failed" if unexpected_side_effects else "passed"
+        verification = "passed" if target_ok and not unexpected_side_effects else "failed"
 
     if not allowed:
         outcome = "denied"
-    elif result.success_claim is not True:
+    elif execution_status != "succeeded":
         outcome = "execution_failed"
-    elif verification == "failed":
-        outcome = "verification_failed"
-    else:
+    elif verification == "passed":
         outcome = "verified"
+    else:
+        outcome = "verification_failed"
+
+    proposal = case.proposal if type(case.proposal) is dict else {}
+    checked_at = result.authorization_checked_at
+    execution_error = None
+    if result.error_type is not None:
+        execution_error = {"type": result.error_type, "message": result.error_message}
 
     return {
         "case": case.label,
         "finding_id": ASSIGNMENT.finding_id,
         "ticket": FINDING.copy(),
         "authenticated_principal": case.principal,
-        "proposed_action": case.proposal.get("action"),
-        "proposed_target": case.proposal.get("resource"),
+        "proposed_action": proposal.get("action"),
+        "proposed_target": proposal.get("resource"),
         "assigned_action": ASSIGNMENT.action,
         "assigned_target": ASSIGNMENT.resource,
         "authorization_decision": "allowed" if allowed else "denied",
         "authorization_reason": result.decision.value,
-        "execution_attempted": executor.execution_attempts > 0,
+        "authorization_checked_at": checked_at.isoformat() if checked_at is not None else None,
+        "assignment_expires_at": ASSIGNMENT.expires_at.isoformat(),
+        "execution_attempted": attempted,
         "execution_attempts": executor.execution_attempts,
+        "execution_status": execution_status,
         "executor_success_claim": result.success_claim,
+        "execution_error": execution_error,
         "state_before": before,
-        "state_after": resource_state.copy(),
+        "state_after": after,
+        "target_verification": target_verification,
+        "side_effect_check": side_effect_check,
+        "unexpected_side_effects": unexpected_side_effects,
         "verification": verification,
         "finding_status": "verified" if outcome == "verified" else "open",
         "outcome": outcome,
@@ -111,17 +165,35 @@ def run_case(case: Case) -> dict:
 
 
 def check_expected(event: dict) -> None:
-    reason, claim, verification, status, target_state = EXPECTED[event["case"]]
+    label = event["case"]
+    reason, claim, target_state, archive_state = EXPECTED[label]
+    allowed = reason == "assignment_matches"
+    verification = "not_run"
+    target_verification = "not_run"
+    side_effect_check = "not_run"
+    execution_status = "not_run"
+    unexpected_side_effects = None
+    if allowed:
+        verification = "passed" if target_state and not archive_state else "failed"
+        target_verification = "passed" if target_state else "failed"
+        side_effect_check = "failed" if archive_state else "passed"
+        execution_status = "succeeded" if claim is True else "failed"
+        unexpected_side_effects = [OTHER] if archive_state else []
     expected = {
-        "authorization_decision": "denied" if claim is None else "allowed",
+        "authorization_decision": "allowed" if allowed else "denied",
         "authorization_reason": reason,
-        "execution_attempted": claim is not None,
-        "execution_attempts": int(claim is not None),
+        "execution_attempted": allowed,
+        "execution_attempts": int(allowed),
+        "execution_status": execution_status,
         "executor_success_claim": claim,
+        "execution_error": EXPECTED_ERRORS.get(label),
         "state_before": INITIAL_STATE,
-        "state_after": {TARGET: target_state, OTHER: False},
+        "state_after": {TARGET: target_state, OTHER: archive_state},
         "verification": verification,
-        "finding_status": status,
+        "target_verification": target_verification,
+        "side_effect_check": side_effect_check,
+        "unexpected_side_effects": unexpected_side_effects,
+        "finding_status": "verified" if claim is True and verification == "passed" else "open",
     }
     for field, value in expected.items():
         if event[field] != value:

@@ -16,10 +16,11 @@ from demo import (
     TARGET,
     TICK,
     VALID_PROPOSAL,
+    Case,
     main,
     run_case,
 )
-from lab import Decision, Executor, verify
+from lab import Decision, Executor, changed_outside_assignment, verify
 
 
 class WorkflowTests(unittest.TestCase):
@@ -52,13 +53,25 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(verify(ASSIGNMENT, {OTHER: True}))
         self.assertTrue(verify(ASSIGNMENT, {TARGET: True, OTHER: False}))
 
+    def test_side_effect_check_compares_all_outside_resources_with_the_baseline(self):
+        before = {TARGET: False, OTHER: True, "changed": True, "removed": False}
+        after = {TARGET: True, OTHER: True, "changed": False, "added": False}
+        self.assertEqual(
+            changed_outside_assignment(ASSIGNMENT, before, after),
+            ["added", "changed", "removed"],
+        )
+
     def test_execution_failure_is_distinct_from_verification_failure(self):
         with patch("demo.INITIAL_STATE", {OTHER: False}):
             event = run_case(CASES[0])
         self.assertEqual(event["authorization_decision"], "allowed")
         self.assertTrue(event["execution_attempted"])
         self.assertIs(event["executor_success_claim"], False)
-        self.assertEqual(event["verification"], "not_run")
+        self.assertEqual(event["execution_status"], "failed")
+        self.assertIsNone(event["execution_error"])
+        self.assertEqual(event["target_verification"], "failed")
+        self.assertEqual(event["side_effect_check"], "passed")
+        self.assertEqual(event["verification"], "failed")
         self.assertEqual(event["finding_status"], "open")
         self.assertEqual(event["outcome"], "execution_failed")
 
@@ -69,12 +82,77 @@ class WorkflowTests(unittest.TestCase):
         lines = output.getvalue().splitlines()
         events = [json.loads(line) for line in lines if line.startswith("{")]
         self.assertEqual([event["case"] for event in events], [case.label for case in CASES])
-        self.assertTrue(all(event["finding_id"] == "F-001" for event in events))
+        for event, case in zip(events, CASES):
+            with self.subTest(case=case.label):
+                self.assertEqual(event["finding_id"], "F-001")
+                self.assertEqual(event["authorization_checked_at"], case.now.isoformat())
+                self.assertEqual(event["assignment_expires_at"], EXPIRY.isoformat())
         self.assertEqual(
             lines[-1],
-            "Summary: 8 cases | verified: 2 | denied: 5 | execution failures: 0 | "
-            "verification failures: 1",
+            "Summary: 11 cases | verified: 2 | denied: 5 | execution failures: 2 | "
+            "verification failures: 2",
         )
+
+    def test_collateral_change_keeps_finding_open_after_a_successful_write(self):
+        case = next(case for case in CASES if case.label == "collateral_write")
+        event = run_case(case)
+
+        self.assertEqual(event["execution_status"], "succeeded")
+        self.assertIs(event["executor_success_claim"], True)
+        self.assertEqual(event["execution_attempts"], 1)
+        self.assertEqual(event["state_before"], {TARGET: False, OTHER: False})
+        self.assertEqual(event["state_after"], {TARGET: True, OTHER: True})
+        self.assertEqual(event["target_verification"], "passed")
+        self.assertEqual(event["side_effect_check"], "failed")
+        self.assertEqual(event["unexpected_side_effects"], [OTHER])
+        self.assertEqual(event["verification"], "failed")
+        self.assertEqual(event["outcome"], "verification_failed")
+        self.assertEqual(event["finding_status"], "open")
+
+    def test_writer_exceptions_emit_events_and_keep_the_finding_open(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            main()
+        events = {}
+        for line in output.getvalue().splitlines():
+            if line.startswith("{"):
+                event = json.loads(line)
+                events[event["case"]] = event
+
+        for label, target_changed, message in (
+            ("exception_before_write", False, "writer failed before changing state"),
+            ("exception_after_write", True, "writer failed after changing target"),
+        ):
+            with self.subTest(case=label):
+                event = events[label]
+                target_result = "passed" if target_changed else "failed"
+                self.assertEqual(event["authorization_decision"], "allowed")
+                self.assertEqual(event["authorization_reason"], "assignment_matches")
+                self.assertTrue(event["execution_attempted"])
+                self.assertEqual(event["execution_attempts"], 1)
+                self.assertEqual(event["execution_status"], "failed")
+                self.assertIsNone(event["executor_success_claim"])
+                self.assertEqual(
+                    event["execution_error"], {"type": "RuntimeError", "message": message}
+                )
+                self.assertEqual(event["state_before"], {TARGET: False, OTHER: False})
+                self.assertEqual(event["state_after"], {TARGET: target_changed, OTHER: False})
+                self.assertEqual(event["target_verification"], target_result)
+                self.assertEqual(event["side_effect_check"], "passed")
+                self.assertEqual(event["unexpected_side_effects"], [])
+                self.assertEqual(event["verification"], target_result)
+                self.assertEqual(event["outcome"], "execution_failed")
+                self.assertEqual(event["finding_status"], "open")
+
+    def test_event_represents_checks_that_did_not_run(self):
+        event = run_case(Case("invalid", None))
+        self.assertEqual(event["authorization_reason"], "invalid_proposal")
+        self.assertIsNone(event["authorization_checked_at"])
+        self.assertEqual(event["assignment_expires_at"], EXPIRY.isoformat())
+        self.assertEqual(event["execution_status"], "not_run")
+        self.assertEqual(event["target_verification"], "not_run")
+        self.assertEqual(event["side_effect_check"], "not_run")
+        self.assertIsNone(event["unexpected_side_effects"])
 
     def test_demo_exits_nonzero_when_a_case_differs_from_expectations(self):
         with patch("demo.verify", return_value=False), redirect_stdout(io.StringIO()):
@@ -156,9 +234,44 @@ class ExecutorTests(unittest.TestCase):
 
         self.assertIs(result.decision, Decision.EXPIRED_ASSIGNMENT)
         self.assertEqual(result.decision.value, "expired_assignment")
+        self.assertEqual(result.authorization_checked_at, now)
         self.assertIsNone(result.success_claim)
         self.assertEqual(self.executor.execution_attempts, 0)
         self.assertEqual(self.state, before)
+        self.write.assert_not_called()
+
+    def test_authorization_records_the_single_clock_reading_used(self):
+        checked_at = EXPIRY - TICK
+        clock = Mock(side_effect=[checked_at, EXPIRY])
+        executor = Executor(
+            ASSIGNMENT,
+            authenticated_principal=PRINCIPAL,
+            clock=clock,
+            enable_logging=self.write,
+        )
+
+        result = executor.execute(VALID_PROPOSAL)
+
+        self.assertIs(result.decision, Decision.ALLOWED)
+        self.assertEqual(result.authorization_checked_at, checked_at)
+        clock.assert_called_once_with()
+
+    def test_writer_keyboard_interrupt_propagates(self):
+        self.write.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.executor.execute(VALID_PROPOSAL)
+        self.assertEqual(self.executor.execution_attempts, 1)
+
+    def test_clock_error_propagates_without_calling_writer(self):
+        executor = Executor(
+            ASSIGNMENT,
+            authenticated_principal=PRINCIPAL,
+            clock=Mock(side_effect=RuntimeError("clock failure")),
+            enable_logging=self.write,
+        )
+        with self.assertRaisesRegex(RuntimeError, "clock failure"):
+            executor.execute(VALID_PROPOSAL)
+        self.assertEqual(executor.execution_attempts, 0)
         self.write.assert_not_called()
 
     def test_assignment_rejects_naive_and_non_utc_expiry(self):

@@ -39,6 +39,9 @@ class Decision(Enum):
 class Execution:
     decision: Decision
     success_claim: bool | None = None
+    authorization_checked_at: datetime | None = None
+    error_type: str | None = None
+    error_message: str | None = None
 
 
 class Executor:
@@ -62,24 +65,34 @@ class Executor:
 
     def execute(self, proposal: object) -> Execution:
         """Apply authorization on every call before invoking the write."""
-        decision = self._authorize(proposal)
-        if decision is not Decision.ALLOWED:
-            return Execution(decision)
-
-        self._execution_attempts += 1
-        return Execution(decision, self._enable_logging(self._assignment.resource))
-
-    def _authorize(self, proposal: object) -> Decision:
         if (
             type(proposal) is not dict
             or proposal.keys() != {"action", "resource"}
             or any(type(value) is not str or not value.strip() for value in proposal.values())
         ):
-            return Decision.INVALID_PROPOSAL
+            return Execution(Decision.INVALID_PROPOSAL)
 
-        assignment = self._assignment
         now = self._clock()
         _require_utc(now)
+        decision = self._authorize(proposal, now)
+        if decision is not Decision.ALLOWED:
+            return Execution(decision, authorization_checked_at=now)
+
+        resource = self._assignment.resource
+        self._execution_attempts += 1
+        try:
+            success_claim = self._enable_logging(resource)
+        except Exception as error:
+            return Execution(
+                decision,
+                authorization_checked_at=now,
+                error_type=type(error).__name__,
+                error_message=str(error),
+            )
+        return Execution(decision, success_claim, authorization_checked_at=now)
+
+    def _authorize(self, proposal: dict[str, str], now: datetime) -> Decision:
+        assignment = self._assignment
         if now >= assignment.expires_at:
             return Decision.EXPIRED_ASSIGNMENT
         if self._principal != assignment.principal:
@@ -92,8 +105,21 @@ class Executor:
 
 
 def verify(assignment: Assignment, resource_state: Mapping[str, bool]) -> bool:
-    """Check the assigned outcome using observed state."""
+    """Check whether the assigned resource reached the intended state."""
     return (
         assignment.action == ENABLE_LOGGING
         and resource_state.get(assignment.resource) is True
+    )
+
+
+def changed_outside_assignment(
+    assignment: Assignment,
+    before: Mapping[str, bool],
+    after: Mapping[str, bool],
+) -> list[str]:
+    """List other resources with changed values or membership."""
+    return sorted(
+        resource
+        for resource in before.keys() | after.keys()
+        if resource != assignment.resource and before.get(resource) != after.get(resource)
     )

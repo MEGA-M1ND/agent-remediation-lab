@@ -50,10 +50,20 @@ Summary: 8 cases | verified: 2 | denied: 5 | execution failures: 0 | verificatio
 
 The summary counts come from the actual events. The demo exits with a nonzero status if a case differs from its expected outcome.
 
+## Authorization expiry
+
+The trusted assignment carries the UTC deadline. The harness injects a fixed UTC clock for each fixture. The executor reads that clock on each well-formed call to `execute()`. Proposals contain only the action and resource.
+
+| Clock reading for an otherwise valid proposal | Expected result |
+| --- | --- |
+| One microsecond before expiry | Allowed. The assigned resource changes and the archive stays unchanged. |
+| Exactly at expiry | `expired_assignment`. Zero execution attempts and both resources unchanged. |
+| One microsecond after expiry | `expired_assignment`. Zero execution attempts and both resources unchanged. |
+
 ## Walkthrough
 
 1. In `demo.py`, the harness loads the ticket and supplies an authenticated principal, a trusted assignment, a fixed UTC clock, and fresh state for both resources. The ticket provides context. The trusted assignment binds F-001 to the assigned action and resource.
-2. In `lab.py`, `Executor.execute()` validates that the proposal contains two nonempty strings, `action` and `resource`. It checks the trusted principal, assigned scope, and UTC deadline before it calls the write operation. A valid proposal can execute strictly before expiry.
+2. In `lab.py`, `Executor.execute()` validates that the proposal contains two nonempty strings, `action` and `resource`. It checks the trusted principal, assigned scope, and UTC deadline before it calls the write operation.
 3. After a reported success, `verify()` reads the state of the resource named in the trusted assignment. Only a passed verification closes the finding. The harness leaves the finding open after a denial, reported execution failure, or verification failure and records each outcome separately.
 4. `tests/test_lab.py` checks the A–E fixtures, proposal validation, and expiry boundaries. Its write spy confirms that a denied call never reaches the write operation.
 

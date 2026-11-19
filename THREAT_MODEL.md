@@ -7,8 +7,8 @@ The assets are audit-logging state on `demo-audit-store` and `demo-archive`, the
 ## Trust boundaries
 
 - The sender controls the ticket and proposal. The proposal schema accepts only the action and resource. Extra fields and malformed values are rejected. Apparent identities, deadlines, or fault controls supplied in a proposal cannot change authorization.
-- The harness supplies the authenticated principal, assignment, UTC deadline, and clock. The fixed assignment scopes `remediation-worker` to `enable_audit_logging` on `demo-audit-store` and binds the result to F-001. Ticket data is shown in the event for context.
-- The public execution boundary authorizes every request before it invokes the simulated writer. A valid request at or after expiry is denied as `expired_assignment`. The writer can claim success while dropping the write, as the trusted harness demonstrates in D.
+- The harness supplies the authenticated principal, the assignment, and a fixed clock for each fixture. The assignment carries the UTC deadline, scopes `remediation-worker` to `enable_audit_logging` on `demo-audit-store`, and binds the result to F-001. Ticket data is shown in the event for context.
+- The public execution boundary reads the trusted clock for each well-formed proposal before it can invoke the simulated writer. An otherwise valid proposal is allowed only while the clock reads strictly before expiry. At or after expiry, the result is `expired_assignment`, the writer receives no call, and both resources stay unchanged. Naive timestamps and nonzero UTC offsets cause a configuration error before any write. The writer can claim success while dropping the write, as the trusted harness demonstrates in D.
 - The verifier receives the trusted assignment and directly reads the shared in-memory state. It checks audit logging on the assigned target after a success claim. A denial or reported execution failure skips verification. Only successful state verification marks F-001 verified.
 
 ## Fixture coverage

@@ -2,6 +2,8 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
+from datetime import timedelta, timezone
 from unittest.mock import Mock, patch
 
 from demo import (
@@ -108,6 +110,7 @@ class ExecutorTests(unittest.TestCase):
             {**VALID_PROPOSAL, "principal": PRINCIPAL},
             {**VALID_PROPOSAL, "drop_write": True},
             {**VALID_PROPOSAL, "expires_at": EXPIRY.isoformat()},
+            {**VALID_PROPOSAL, "now": (EXPIRY - TICK).isoformat()},
         ):
             with self.subTest(proposal=proposal):
                 result = self.executor.execute(proposal)
@@ -147,14 +150,39 @@ class ExecutorTests(unittest.TestCase):
         self.assert_expiry_denial(EXPIRY + TICK)
 
     def assert_expiry_denial(self, now):
+        before = self.state.copy()
         self.now = now
         result = self.executor.execute(VALID_PROPOSAL)
 
         self.assertIs(result.decision, Decision.EXPIRED_ASSIGNMENT)
+        self.assertEqual(result.decision.value, "expired_assignment")
         self.assertIsNone(result.success_claim)
         self.assertEqual(self.executor.execution_attempts, 0)
-        self.assertEqual(self.state, {TARGET: False, OTHER: False})
+        self.assertEqual(self.state, before)
         self.write.assert_not_called()
+
+    def test_assignment_rejects_naive_and_non_utc_expiry(self):
+        for expiry in (
+            EXPIRY.replace(tzinfo=None),
+            EXPIRY.astimezone(timezone(timedelta(hours=1))),
+        ):
+            with self.subTest(expiry=expiry):
+                with self.assertRaisesRegex(ValueError, "timezone-aware UTC"):
+                    replace(ASSIGNMENT, expires_at=expiry)
+
+    def test_invalid_clock_readings_never_reach_the_writer(self):
+        before = self.state.copy()
+        for now in (
+            self.now.replace(tzinfo=None),
+            self.now.astimezone(timezone(timedelta(hours=1))),
+        ):
+            with self.subTest(now=now):
+                self.now = now
+                with self.assertRaisesRegex(ValueError, "timezone-aware UTC"):
+                    self.executor.execute(VALID_PROPOSAL)
+                self.assertEqual(self.executor.execution_attempts, 0)
+                self.assertEqual(self.state, before)
+                self.write.assert_not_called()
 
     def test_clock_is_checked_again_on_later_execution(self):
         self.assertIs(self.executor.execute(VALID_PROPOSAL).decision, Decision.ALLOWED)

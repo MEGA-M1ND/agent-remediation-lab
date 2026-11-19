@@ -1,0 +1,49 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Run demo
+        run: python demo.py
+      - name: Run full test suite
+        run: python -m unittest discover -v
+
+  deliver:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Package and verify distribution
+        run: |
+          git archive --format=zip --output=agent-remediation-lab.zip HEAD \
+            lab.py demo.py tests README.md THREAT_MODEL.md
+          python -m zipfile -e agent-remediation-lab.zip "$RUNNER_TEMP/lab"
+          cd "$RUNNER_TEMP/lab"
+          python demo.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-remediation-lab
+          path: agent-remediation-lab.zip
+          if-no-files-found: error
